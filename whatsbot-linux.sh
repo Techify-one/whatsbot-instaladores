@@ -176,8 +176,8 @@ apt_preparar() {
 
 instalar_pacotes() {
   apt_preparar
-  # psmisc (fuser) é o que o linux_start.sh usa para liberar a porta; unzip e curl, para baixar o GOWA.
-  $APT install -y -qq ca-certificates curl wget git unzip iproute2 psmisc python3 python3-venv >/dev/null
+  # psmisc (fuser) é o que o linux_start.sh usa para liberar a porta; procps (pkill) para parar a execução anterior; unzip e curl, para baixar o GOWA.
+  $APT install -y -qq ca-certificates curl wget git unzip iproute2 psmisc procps python3 python3-venv >/dev/null
 }
 
 garantir_python() {
