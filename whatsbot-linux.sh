@@ -278,7 +278,7 @@ preparar_codigo() {
 # do serviço (e o painel, sem senha, aceita plugins), então rodá-lo como root seria uma escalada de privilégio.
 escrever_unit() {
   if [ -f "$UNIT" ] && ! unit_desta_pasta; then
-    die "já existe um serviço 'whatsbot-lite' apontando para outra pasta. Remova-o antes (systemctl disable --now whatsbot-lite) ou use outra instalação."
+    die "já existe um serviço 'whatsbot-lite' em $UNIT apontando para outra pasta ($(sed -n 's/^WorkingDirectory=//p' "$UNIT")). Desligar não basta, o arquivo precisa sair (guarde uma cópia se quiser): systemctl disable --now whatsbot-lite; mv $UNIT /root/whatsbot-lite.service.bak; systemctl daemon-reload. Ou instale sem serviço: WHATSBOT_SYSTEMD=0."
   fi
   cat > "$UNIT" <<EOF
 [Unit]
