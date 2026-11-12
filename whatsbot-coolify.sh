@@ -9,28 +9,32 @@
 #  Antes: aponte o domínio (registro A) para o IP público deste servidor
 #  e deixe as portas 80 e 443 abertas no firewall.
 #
+#  Só para servidor LIMPO: se o Coolify já estiver instalado, o script para sem mexer em nada.
+#
 #  Sem perguntas (automação), defina as variáveis antes do comando:
-#    DOMINIO=bot.exemplo.com  EMAIL=voce@gmail.com  SENHA='...'
-#    [DOMINIO_PAINEL=coolify.exemplo.com]  [USUARIO=admin]  [FORCAR=1]
-#  Pode rodar de novo: atualiza o WhatsBot e preserva os dados.
+#    WHATSBOT_DOMINIO=bot.exemplo.com  WHATSBOT_EMAIL=voce@gmail.com  WHATSBOT_SENHA='...'
+#    [WHATSBOT_DOMINIO_PAINEL=coolify.exemplo.com]  [WHATSBOT_USUARIO=admin]  [WHATSBOT_FORCAR=1]
 # =====================================================================
 set -Eeuo pipefail
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"   # "su" sem o traço não traz o sbin (useradd, runuser, ss)
 
-REPO="${REPO:-https://github.com/Techify-one/whatsbot-lite}"
-BRANCH="${BRANCH:-main}"
+REPO="${WHATSBOT_REPO:-https://github.com/Techify-one/whatsbot-lite}"
+BRANCH="${WHATSBOT_BRANCH:-main}"
 # Versão do Coolify validada com este script (o deploy usa a API dele, que pode mudar entre versões).
-COOLIFY_VERSION="${COOLIFY_VERSION:-4.7.5}"
-DNS_TIMEOUT="${DNS_TIMEOUT:-1800}"   # segundos esperando o DNS apontar para este servidor
+COOLIFY_VERSION="${WHATSBOT_COOLIFY_VERSION:-4.7.5}"
+DNS_TIMEOUT="${WHATSBOT_DNS_TIMEOUT:-1800}"   # segundos esperando o DNS apontar para este servidor
 
-DOMINIO="${DOMINIO:-}"
-DOMINIO_PAINEL="${DOMINIO_PAINEL:-}"
-EMAIL="${EMAIL:-}"
-SENHA="${SENHA:-}"
-USUARIO="${USUARIO:-admin}"
-FORCAR="${FORCAR:-0}"   # 1 = segue sem perguntar quando algo foge do recomendado
+DOMINIO="${WHATSBOT_DOMINIO:-}"
+DOMINIO_PAINEL="${WHATSBOT_DOMINIO_PAINEL:-}"
+EMAIL="${WHATSBOT_EMAIL:-}"
+SENHA="${WHATSBOT_SENHA:-}"
+USUARIO="${WHATSBOT_USUARIO:-admin}"
+FORCAR="${WHATSBOT_FORCAR:-0}"   # 1 = segue sem perguntar quando algo foge do recomendado
+IP4_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+APT_OUT=""
 
 TOKEN_NAME=whatsbot-provision
-APT="apt-get -o DPkg::Lock::Timeout=300"
+APT="apt-get -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 REGEX_DOMINIO='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*\.[A-Za-z]{2,}$'
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -40,7 +44,20 @@ die()  { printf '\n\033[1;31mERRO:\033[0m %s\n' "$*" >&2; exit 1; }
 
 have_tty()  { { : </dev/tty; } 2>/dev/null; }
 port_busy() { ss -ltn "( sport = :$1 )" 2>/dev/null | awk 'NR>1' | grep -q .; }
-local_ip()  { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'; }
+local_ip()  { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true; }
+public_ip() {
+  local u p
+  for u in https://ifconfig.io https://api.ipify.org https://checkip.amazonaws.com https://icanhazip.com; do
+    p=$(curl -4fsS -m 8 "$u" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ "$p" =~ $IP4_RE ]]; then printf '%s' "$p"; return 0; fi
+  done
+  return 0
+}
+http_ok()   {
+  if command -v curl >/dev/null 2>&1; then curl -fsI -m 15 "$1" >/dev/null 2>&1
+  elif command -v wget >/dev/null 2>&1; then wget -q --spider -T 15 "$1"
+  else return 0; fi
+}
 psql_c()    { docker exec -i coolify-db psql -q -U coolify -d coolify -v ON_ERROR_STOP=1 -tA "$@"; }
 
 # DNS pelo resolvedor público (1.1.1.1), sem cache local: é o que o Let's Encrypt enxerga.
@@ -61,7 +78,6 @@ confirmar_continuar() {
 # ---------------------------------------------------------------- verificações
 
 verificar_sistema() {
-  . /etc/os-release
   local id=${ID:-?} ver=${VERSION_ID:-} nome=${PRETTY_NAME:-desconhecido} aviso=""
   case "$id" in
     ubuntu)
@@ -109,32 +125,69 @@ verificar_recursos() {
   return 0
 }
 
+# Espera outro apt terminar (cloud-init, atualização automática logo após criar a VPS).
+apt_update() {
+  local i
+  for i in $(seq 1 30); do
+    if APT_OUT=$($APT update 2>&1); then return 0; fi
+    if grep -qiE "Could not get lock|Unable to acquire the dpkg|is another process using it" <<<"$APT_OUT"; then
+      if [ "$i" = 1 ]; then info "outro processo está usando o apt (atualização automática?); aguardando..."; fi
+      sleep 10
+    else
+      return 1
+    fi
+  done
+  return 1
+}
+
+# Ubuntu intermediário (ex.: 24.10) sai de suporte e some do archive.ubuntu.com. Só mexe quando o erro é
+# exatamente "o codinome desta máquina não tem mais Release" e o old-releases tem esse codinome.
+corrigir_apt_ubuntu_antigo() {
+  [ "${ID:-}" = ubuntu ] && [ -n "${VERSION_CODENAME:-}" ] || return 1
+  grep -qE "The repository '[^']*(archive|security)\.ubuntu\.com[^']* ${VERSION_CODENAME}[a-z-]* Release' (no longer has|does not have) a Release file" <<<"$APT_OUT" || return 1
+  http_ok "http://old-releases.ubuntu.com/ubuntu/dists/${VERSION_CODENAME}/Release" || return 1
+  warn "o Ubuntu ${VERSION_ID:-} saiu de suporte; usando o arquivo old-releases.ubuntu.com (cópia das fontes originais em *.bak-whatsbot)."
+  local f
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+    [ -f "$f" ] || continue
+    grep -q 'ubuntu\.com/ubuntu' "$f" || continue
+    if [ ! -e "$f.bak-whatsbot" ]; then cp -a "$f" "$f.bak-whatsbot"; fi
+    sed -i -E 's#https?://(archive|security|[a-z]{2}\.archive)\.ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#g' "$f"
+  done
+  return 0
+}
+
+restaurar_apt() {
+  local b
+  for b in /etc/apt/sources.list.bak-whatsbot /etc/apt/sources.list.d/*.bak-whatsbot; do
+    [ -f "$b" ] && mv -f "$b" "${b%.bak-whatsbot}"
+  done
+  return 0
+}
+
 apt_preparar() {
   export DEBIAN_FRONTEND=noninteractive
-  local out f
-  out=$($APT update 2>&1) || true
-  # Ubuntu intermediário (ex.: 24.10) sai de suporte e some do archive.ubuntu.com (apt dá 404).
-  if grep -qE "(no longer has|does not have) a Release file|404 +Not Found" <<<"$out"; then
-    warn "esta versão do Ubuntu saiu de suporte; usando o arquivo old-releases.ubuntu.com."
-    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-      if [ -f "$f" ]; then
-        sed -i -E 's#https?://(archive|security|[a-z]{2}\.archive)\.ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#g' "$f"
-      fi
-    done
+  if ! apt_update; then
+    if ! { corrigir_apt_ubuntu_antigo && apt_update; }; then
+      restaurar_apt
+      printf '%s\n' "$APT_OUT" | tail -6 >&2
+      die "o apt não conseguiu atualizar a lista de pacotes (veja acima)."
+    fi
   fi
-  $APT update -qq >/dev/null
   $APT install -y -qq ca-certificates curl wget git jq openssl iproute2 python3 >/dev/null
 }
 
 # ---------------------------------------------------------------- perguntas
 
+# Só símbolos que passam sem alteração pelo .env e pelo compose do Coolify (sem espaço, $, &, |, \\, #, aspas).
+SIMBOLOS_OK='!@%^*_+=.,:?-'
 valid_password() {
-  [[ ${#1} -ge 8 && $1 =~ [A-Z] && $1 =~ [a-z] && $1 =~ [0-9] && $1 =~ [^A-Za-z0-9] ]]
+  [[ ${#1} -ge 8 && ${#1} -le 64 && $1 =~ ^[A-Za-z0-9!@%^*_+=.,:?-]+$ && $1 =~ [A-Z] && $1 =~ [a-z] && $1 =~ [0-9] && $1 =~ [!@%^*_+=.,:?-] ]]
 }
 
 # O Coolify só cria o administrador se o e-mail tiver domínio com DNS (MX ou A).
 email_ok() {
-  [[ "$1" =~ ^[^@\ ]+@[^@\ ]+\.[^@\ ]+$ ]] || return 1
+  [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || return 1
   # Se o DNS-over-HTTPS estiver bloqueado aqui, não dá para checar: aceita pelo formato.
   [ -n "$(doh cloudflare.com 1)" ] || return 0
   local d=${1#*@}
@@ -184,9 +237,9 @@ fazer_perguntas() {
     local s1="" s2=""
     if have_tty; then
       while :; do
-        read -r -s -p "  4) Senha do Coolify (8+ caracteres com maiúscula, minúscula, número e símbolo; Enter = gerar): " s1 </dev/tty; echo >&2
+        read -r -s -p "  4) Senha do Coolify (8+ caracteres com maiúscula, minúscula, número e um símbolo entre !@%^*_+=.,:?-; Enter = gerar): " s1 </dev/tty; echo >&2
         if [ -z "$s1" ]; then break; fi
-        if ! valid_password "$s1"; then printf '    senha fraca: faltou maiúscula, minúscula, número ou símbolo, ou tem menos de 8 caracteres.\n' >&2; continue; fi
+        if ! valid_password "$s1"; then printf '    senha inválida: use 8 a 64 caracteres com maiúscula, minúscula, número e um símbolo entre  !@%%^*_+=.,:?-  (sem espaço, $, &, #, aspas).\n' >&2; continue; fi
         read -r -s -p "     Repita a senha: " s2 </dev/tty; echo >&2
         if [ "$s1" = "$s2" ]; then break; fi
         printf '    as senhas não conferem.\n' >&2
@@ -198,7 +251,7 @@ fazer_perguntas() {
     SENHA="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-14)Aa1!"
     SENHA_GERADA=1
   fi
-  valid_password "$SENHA" || die "a senha precisa de 8+ caracteres com maiúscula, minúscula, número e símbolo. Sem isso o Coolify descarta o usuário em silêncio e deixa o cadastro aberto."
+  valid_password "$SENHA" || die "senha inválida: use 8 a 64 caracteres com maiúscula, minúscula, número e um símbolo entre !@%^*_+=.,:? ou - (sem espaço, \$, &, #, aspas). Sem isso o Coolify descarta o usuário em silêncio e deixa o cadastro aberto."
   [[ "$USUARIO" =~ ^[A-Za-z0-9_\ -]{3,}$ ]] || die "USUARIO precisa ter 3+ caracteres (letras, números, espaço, - ou _)."
 }
 
@@ -209,7 +262,11 @@ aguardar_dns() {  # $1 = domínio  $2 = IP público deste servidor
   local d=$1 ip=$2 t0=$SECONDS got last="" msg
   info "conferindo $d"
   while :; do
-    got=$(doh "$d" 1 | awk 'NR==1')
+    if [ -n "$(doh cloudflare.com 1)" ]; then got=$(doh "$d" 1 | awk 'NR==1')
+    else
+      # DNS-over-HTTPS bloqueado aqui: usa o resolvedor do próprio servidor (pode estar em cache).
+      got=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1{print $1}' || true)
+    fi
     if [ "$got" = "$ip" ]; then
       info "DNS ok: $d -> $ip"
       local aaaa; aaaa=$(doh "$d" 28 | awk 'NR==1')
@@ -249,6 +306,7 @@ testar_porta80() {  # $1 = domínio
 
 # ---------------------------------------------------------------- Coolify
 
+# Só roda em instalação nova (o script recusa servidor com Coolify), então a API nasce desligada.
 api_cleanup() {
   psql_c -c "DELETE FROM personal_access_tokens WHERE name = '$TOKEN_NAME'" >/dev/null 2>&1 || true
   psql_c -c "UPDATE instance_settings SET is_api_enabled = false WHERE id = 0" >/dev/null 2>&1 || true
@@ -364,38 +422,50 @@ SQL
   step "Construindo e publicando o WhatsBot (3 a 8 minutos)"
   d=$(capi POST "/deploy?uuid=$app" '{}' | jq -r '.deployments[0].deployment_uuid')
   [ -n "$d" ] && [ "$d" != null ] || die "o deploy não entrou na fila."
-  s=""
+  s=""; local falhas=0
   for i in $(seq 1 240); do
-    s=$(capi GET "/deployments/$d" | jq -r .status)
-    case $s in
-      finished) break ;;
-      failed|cancelled-by-user) die "o deploy terminou como '$s'. Veja no painel do Coolify: WhatsBot > $app_name > Deployments." ;;
-    esac
+    # A API pode devolver 502/503 por alguns segundos enquanto a imagem é construída neste mesmo servidor.
+    if s=$(capi GET "/deployments/$d" 2>/dev/null | jq -r .status 2>/dev/null) && [ -n "$s" ]; then
+      falhas=0
+      case $s in
+        finished) break ;;
+        failed|cancelled-by-user) die "o deploy terminou como '$s'. Veja no painel do Coolify: WhatsBot > $app_name > Deployments." ;;
+      esac
+    else
+      s=""; falhas=$((falhas + 1))
+      if [ "$falhas" -ge 24 ]; then die "a API do Coolify parou de responder (2 minutos). Veja: docker logs coolify --tail 30"; fi
+    fi
     sleep 5
   done
   [ "$s" = finished ] || die "tempo esgotado esperando o deploy (último estado: $s)."
 }
 
+# Servidor com Coolify, ou com sobras de uma tentativa anterior: não mexe (rodar o instalador por cima
+# trocaria a versão e as configurações dele). Para refazer do zero, apague /data/coolify e os containers.
+exigir_servidor_limpo() {
+  local lista; lista=$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)
+  if grep -qE '^coolify($|-)' <<<"$lista" || [ -d /data/coolify/source ]; then
+    die "este servidor já tem o Coolify (ou sobras de uma instalação anterior). Este instalador é só para servidor limpo, para não alterar o que já existe. Para atualizar o WhatsBot, use o painel do Coolify (Redeploy)."
+  fi
+  local p
+  for p in 80 443 8000 6001 6002; do
+    if port_busy "$p"; then die "a porta $p já está em uso neste servidor (o Coolify precisa de 80, 443, 8000, 6001 e 6002 livres)."; fi
+  done
+}
+
 main() {
   [ "$(id -u)" -eq 0 ] || die "rode como root (use: sudo -i)"
+  # shellcheck disable=SC1091
+  . /etc/os-release
 
   step "Verificando o servidor"
   verificar_sistema
   verificar_recursos
   step "Preparando o servidor"
   apt_preparar   # antes das portas: num Debian limpo o "ss" (iproute2) ainda não existe
+  exigir_servidor_limpo
 
-  JA_INSTALADO=0
-  local lista; lista=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
-  if grep -qx coolify <<<"$lista"; then JA_INSTALADO=1; fi
-  if [ "$JA_INSTALADO" = 0 ]; then
-    local p
-    for p in 80 443 8000; do
-      if port_busy "$p"; then die "a porta $p já está em uso neste servidor (o Coolify precisa de 80, 443 e 8000 livres)."; fi
-    done
-  fi
-  IP=$(curl -4fsS -m 8 https://ifconfig.io 2>/dev/null || true)
-  if [ -z "$IP" ]; then IP=$(local_ip); fi
+  IP=$(public_ip); if [ -z "$IP" ]; then IP=$(local_ip); fi
   [ -n "$IP" ] || die "não consegui descobrir o IP deste servidor."
   info "IP público deste servidor: $IP"
 
@@ -405,25 +475,28 @@ main() {
   aguardar_dns "$DOMINIO" "$IP"
   if [ -n "$DOMINIO_PAINEL" ]; then aguardar_dns "$DOMINIO_PAINEL" "$IP"; fi
 
-  if [ "$JA_INSTALADO" = 0 ]; then
-    info "testando se $DOMINIO chega a este servidor pela porta 80"
-    if testar_porta80 "$DOMINIO"; then
-      # O teste parte de dentro do servidor: prova o nome e a porta, não o firewall do provedor.
-      info "porta 80 responde pelo domínio (o firewall externo só é provado quando o certificado sair)"
-    else
-      warn "não consegui abrir http://$DOMINIO daqui mesmo. Causas comuns: a porta 80 ocupada, ou o domínio apontando para outro IP. O certificado HTTPS não será emitido assim."
-      confirmar_continuar
-    fi
+  info "testando se $DOMINIO chega a este servidor pela porta 80"
+  if testar_porta80 "$DOMINIO"; then
+    # O teste parte de dentro do servidor: prova o nome e a porta, não o firewall do provedor.
+    info "porta 80 responde pelo domínio (o firewall externo só é provado quando o certificado sair)"
+  else
+    warn "não consegui abrir http://$DOMINIO daqui mesmo. Causas comuns: a porta 80 ocupada, ou o domínio apontando para outro IP. O certificado HTTPS não será emitido assim."
+    confirmar_continuar
   fi
 
   info "o Let's Encrypt aceita só 5 certificados por semana para o mesmo nome; evite refazer a instalação do zero muitas vezes com o mesmo domínio."
 
-  if [ "$JA_INSTALADO" = 1 ]; then
-    step "Coolify já instalado: atualizando"
-  else
-    step "Instalando o Coolify $COOLIFY_VERSION (instala o Docker junto; leva alguns minutos)"
-  fi
+  step "Instalando o Coolify $COOLIFY_VERSION (instala o Docker junto; leva alguns minutos)"
   instalar_coolify
+
+  # Grava e mostra a senha agora: se o deploy falhar mais adiante, a pessoa ainda consegue entrar no painel.
+  umask 077
+  { echo "Coolify:   http://$IP:8000"; echo "E-mail:    $EMAIL"; echo "Senha:     $SENHA"; } > /root/whatsbot-acesso.txt
+  if [ "$SENHA_GERADA" = 1 ]; then
+    info "Coolify instalado. E-mail: $EMAIL  Senha gerada: $SENHA   (também em /root/whatsbot-acesso.txt)"
+  else
+    info "Coolify instalado. E-mail: $EMAIL  (dados em /root/whatsbot-acesso.txt)"
+  fi
 
   # Domínio do painel antes dos apps: se o DNS ou o certificado falhar, aparece cedo.
   PAINEL_OK=0
@@ -436,14 +509,13 @@ main() {
   criar_whatsbot
 
   step "Esperando o certificado HTTPS"
-  local app_cert=0 painel_cert=0
+  local app_cert=0
   if aguardar_cert "$DOMINIO"; then app_cert=1; info "certificado emitido para $DOMINIO"; fi
-  if [ "$PAINEL_OK" = 1 ] && aguardar_cert "$DOMINIO_PAINEL"; then painel_cert=1; info "certificado emitido para $DOMINIO_PAINEL"; fi
+  if [ "$PAINEL_OK" = 1 ] && aguardar_cert "$DOMINIO_PAINEL"; then info "certificado emitido para $DOMINIO_PAINEL"; fi
   if [ "$app_cert" = 1 ]; then
     if curl -fsS -m 15 "https://$DOMINIO/health" >/dev/null 2>&1; then info "https://$DOMINIO/health respondeu"
     else warn "o certificado saiu, mas https://$DOMINIO/health ainda não respondeu; o WhatsBot pode levar mais alguns segundos."; fi
-  fi
-  if [ "$app_cert" = 0 ]; then
+  else
     warn "o certificado de $DOMINIO não saiu. Veja o motivo:  docker logs coolify-proxy 2>&1 | grep -iE 'acme|certificate' | tail -20"
     warn "depois de corrigir o DNS ou o firewall:  docker restart coolify-proxy"
   fi
@@ -451,23 +523,38 @@ main() {
   local url_app="https://$DOMINIO" url_painel="http://$IP:8000" acesso=/root/whatsbot-acesso.txt
   if [ "$PAINEL_OK" = 1 ]; then url_painel="https://$DOMINIO_PAINEL"; fi
 
+  # Só a senha gerada precisa ser guardada; a que a pessoa digitou ela já conhece.
   umask 077
   {
     echo "WhatsBot:  $url_app"
-    echo "Coolify:   $url_painel   (também em http://$IP:8000)"
+    echo "Coolify:   $url_painel"
     echo "E-mail:    $EMAIL"
-    if [ "$JA_INSTALADO" = 1 ]; then echo "Senha:     a mesma de antes (o Coolify já estava instalado)"
-    else echo "Senha:     $SENHA"; fi
+    echo "Senha:     $SENHA"
   } > "$acesso"
 
   printf '\n\033[1;32mTudo no ar!\033[0m\n\n'
-  sed 's/^/  /' "$acesso"
-  if [ "$SENHA_GERADA" = 1 ] && [ "$JA_INSTALADO" = 0 ]; then printf '\n  A senha foi gerada agora. Estes dados também estão em %s (só o root lê).\n' "$acesso"; fi
+  echo "  WhatsBot:  $url_app"
+  echo "  Coolify:   $url_painel"
+  echo "  E-mail:    $EMAIL"
+  if [ "$SENHA_GERADA" = 1 ]; then
+    echo "  Senha:     $SENHA"
+    printf '\n  A senha foi gerada agora. Estes dados também estão em %s (só o root lê).\n' "$acesso"
+  else
+    echo "  Senha:     a que você digitou (também em $acesso, só o root lê)"
+  fi
   cat <<EOF
 
-  Portas a deixar abertas no firewall: 80 e 443 (WhatsBot e HTTPS).
-  Se o painel do Coolify está em domínio, as portas 8000, 6001 e 6002 podem ser fechadas.
-  Guarde /data/coolify/source/.env (tem a chave APP_KEY do Coolify).
+  Firewall: deixe abertas as portas 80 e 443 (WhatsBot e HTTPS).
+EOF
+  if [ "$PAINEL_OK" = 1 ]; then
+    echo "  O painel do Coolify já está em HTTPS: feche as portas 8000, 6001 e 6002 no firewall do provedor"
+    echo "  (o firewall do próprio servidor, ufw, não fecha portas publicadas pelo Docker)."
+  else
+    echo "  O painel do Coolify está em http://${IP}:8000 (sem HTTPS): use só em rede de confiança e feche a porta 8000 depois."
+  fi
+  cat <<EOF
+  Guarde a linha APP_KEY= de /data/coolify/source/.env (a chave do Coolify). Não compartilhe o arquivo inteiro:
+  ele também contém a senha do administrador.
   Atenção: o painel do WhatsBot não tem senha; qualquer pessoa com o endereço entra.
 
 EOF
