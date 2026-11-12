@@ -336,6 +336,22 @@ instalar_coolify() {
     || die "o usuário administrador não foi criado (senha recusada ou e-mail sem domínio real). Veja: docker logs coolify | grep -A3 'Invalid Root User'"
 }
 
+# O Coolify gerencia o próprio servidor entrando nele por SSH, e o install.sh dele grava a porta 22 fixa.
+# Com o sshd em outra porta, nem o domínio do painel nem o deploy funcionam: ajusta para a porta real.
+ajustar_porta_ssh() {
+  # Porta em que o sshd escuta de fato (vale também com ssh.socket); sem ela, a do sshd_config.
+  local ports p
+  ports=$(ss -ltnpH 2>/dev/null | awk '/"sshd"/{n=split($4,a,":"); print a[n]}' | sort -un || true)
+  if [ -z "$ports" ]; then ports=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' || true); fi
+  p=$(head -n1 <<<"$ports")
+  grep -qx 22 <<<"$ports" && p=22
+  [[ "$p" =~ ^[0-9]+$ ]] || p=22
+  if [ "$p" != 22 ]; then
+    info "o SSH deste servidor está na porta $p; avisando o Coolify (ele usa SSH para gerenciar o próprio servidor)."
+    psql_c -c "UPDATE servers SET port = $p WHERE id = 0" >/dev/null
+  fi
+}
+
 # Define o domínio do painel do próprio Coolify (Configurações > Domínio da instância), sem a interface.
 painel_dominio() {  # $1 = domínio
   local d=$1 out
@@ -429,7 +445,13 @@ SQL
       falhas=0
       case $s in
         finished) break ;;
-        failed|cancelled-by-user) die "o deploy terminou como '$s'. Veja no painel do Coolify: WhatsBot > $app_name > Deployments." ;;
+        failed|cancelled-by-user)
+          # Mostra o motivo que o Coolify registrou (antes só dizia "failed").
+          local motivo
+          motivo=$(capi GET "/deployments/$d" 2>/dev/null | jq -r '(.logs // "[]") | (if type == "string" then fromjson else . end)
+            | map(select(.hidden == false and (.output | startswith("Deployment failed")))) | first | .output // empty' 2>/dev/null || true)
+          if [ -n "$motivo" ]; then warn "$motivo"; fi
+          die "o deploy terminou como '$s'. Veja no painel do Coolify: WhatsBot > $app_name > Deployments." ;;
       esac
     else
       s=""; falhas=$((falhas + 1))
@@ -488,6 +510,7 @@ main() {
 
   step "Instalando o Coolify $COOLIFY_VERSION (instala o Docker junto; leva alguns minutos)"
   instalar_coolify
+  ajustar_porta_ssh
 
   # Grava e mostra a senha agora: se o deploy falhar mais adiante, a pessoa ainda consegue entrar no painel.
   umask 077
