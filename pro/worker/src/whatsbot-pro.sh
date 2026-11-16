@@ -153,9 +153,10 @@ apt_preparar() {
 
 # ---------------------------------------------------------------- perguntas
 
-SIMBOLOS_OK='!@%^*_+=.,:?-'
+# Qualquer caractere imprimível, sem espaço. A senha só passa por jq (variável de ambiente) e pelo argon2 do Pro: não há o que escapar.
+REGRA_SENHA="8 a 64 caracteres, sem espaço, com maiúscula, minúscula, número e um símbolo (ex.: # @ ! - _)"
 valid_password() {
-  [[ ${#1} -ge 8 && ${#1} -le 64 && $1 =~ ^[A-Za-z0-9!@%^*_+=.,:?-]+$ && $1 =~ [A-Z] && $1 =~ [a-z] && $1 =~ [0-9] && $1 =~ [!@%^*_+=.,:?-] ]]
+  [[ ${#1} -ge 8 && ${#1} -le 64 && $1 =~ ^[[:graph:]]+$ && $1 =~ [[:upper:]] && $1 =~ [[:lower:]] && $1 =~ [[:digit:]] && $1 =~ [^[:alnum:]] ]]
 }
 gerar_senha() { printf '%sAa1!' "$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-14)"; }
 
@@ -205,9 +206,9 @@ fazer_perguntas() {
     local s1="" s2=""
     if have_tty; then
       while :; do
-        read -r -s -p "  Senha do administrador do Pro (8+ caracteres com maiúscula, minúscula, número e um símbolo de $SIMBOLOS_OK; Enter = gerar): " s1 </dev/tty; echo >&2
+        read -r -s -p "  Senha do administrador do Pro (Enter = gerar uma; ou $REGRA_SENHA): " s1 </dev/tty; echo >&2
         if [ -z "$s1" ]; then break; fi
-        if ! valid_password "$s1"; then printf '    senha inválida.\n' >&2; continue; fi
+        if ! valid_password "$s1"; then printf '    senha inválida: use %s.\n' "$REGRA_SENHA" >&2; continue; fi
         read -r -s -p "     Repita a senha: " s2 </dev/tty; echo >&2
         if [ "$s1" = "$s2" ]; then break; fi
         printf '    as senhas não conferem.\n' >&2
@@ -216,7 +217,7 @@ fazer_perguntas() {
     SENHA=$s1
   fi
   if [ -z "$SENHA" ]; then SENHA=$(gerar_senha); SENHA_GERADA=1; fi
-  valid_password "$SENHA" || die "senha inválida: use 8 a 64 caracteres com maiúscula, minúscula, número e um símbolo de $SIMBOLOS_OK."
+  valid_password "$SENHA" || die "senha inválida: use $REGRA_SENHA."
   # postgres:// e postgresql:// -> o driver que o Pro usa
   if [ -n "$DB_URL" ]; then DB_URL=$(sed -E 's#^postgres(ql)?(\+psycopg)?://#postgresql+psycopg://#' <<<"$DB_URL"); fi
 }
