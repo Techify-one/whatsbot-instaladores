@@ -1,0 +1,15 @@
+{
+  "name": "whatsbot-pro-instalador",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "scripts.techify.site/whatsbot-pro", "zone_name": "techify.site" },
+    { "pattern": "scripts.techify.site/pro/*", "zone_name": "techify.site" }
+  ],
+  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "whatsbot-pro-instalador", "database_id": "COLE-AQUI-O-ID-DO-SEU-D1" }
+  ],
+  "vars": { "CONTATO_URL": "" }
+}
