@@ -14,7 +14,7 @@
 #    WHATSBOT_EMAIL=voce@gmail.com  WHATSBOT_DOMINIO=pro.exemplo.com  [WHATSBOT_SENHA='...']
 #    [WHATSBOT_DB_URL=postgresql://usuario:senha@host:5432/banco]  [WHATSBOT_NOME=whatsbot-pro]
 #    [WHATSBOT_DOMINIO_PAINEL=coolify.exemplo.com]  [WHATSBOT_FORCAR=1]
-#    [WHATSBOT_COOLIFY_EMAIL=voce@gmail.com]  [WHATSBOT_COOLIFY_SENHA='...']   (só quando o Coolify ainda não existe)
+#    Coolify ainda não instalado (obrigatório nesse caso): WHATSBOT_COOLIFY_EMAIL=voce@gmail.com  [WHATSBOT_COOLIFY_SENHA='...']
 # =====================================================================
 set -Eeuo pipefail
 export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
@@ -30,8 +30,8 @@ DB_URL="${WHATSBOT_DB_URL:-}"
 SENHA="${WHATSBOT_SENHA:-}"
 NOME="${WHATSBOT_NOME:-whatsbot-pro}"
 DOMINIO_PAINEL="${WHATSBOT_DOMINIO_PAINEL:-}"
-CF_EMAIL="${WHATSBOT_COOLIFY_EMAIL:-}"   # login do Coolify; só vale quando o script instala o Coolify
-CF_SENHA="${WHATSBOT_COOLIFY_SENHA:-}"
+COOLIFY_EMAIL="${WHATSBOT_COOLIFY_EMAIL:-}"   # login do Coolify (independe da compra); só vale quando o script instala o Coolify
+COOLIFY_SENHA="${WHATSBOT_COOLIFY_SENHA:-}"
 FORCAR="${WHATSBOT_FORCAR:-0}"
 
 TOKEN_NAME=whatsbot-pro-provision
@@ -50,7 +50,8 @@ ADMIN_RESOLVIDO=0   # 1 = já existe usuário no Pro
 ADMIN_APLICADO=0    # 1 = o administrador é o desta execução (senha confere)
 PAINEL_OK=0
 SENHA_GERADA=0
-CF_SENHA_GERADA=0
+COOLIFY_SENHA_GERADA=0
+NQ=0               # número da pergunta na tela
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -175,7 +176,7 @@ email_ok() {
   local d=${1#*@}
   [ -n "$(doh "$d" 15)" ] || [ -n "$(doh "$d" 1)" ]
 }
-ck_email_opc() { [ -z "$1" ] || email_ok "$1"; }
+ck_dominio_pro() { ck_dominio "$1" && { [ -z "$DOMINIO_PAINEL" ] || [ "$1" != "$DOMINIO_PAINEL" ]; }; }
 ck_dominio() { [[ "$1" =~ $REGEX_DOMINIO ]]; }
 ck_dom_opc() { [ -z "$1" ] || [[ "$1" =~ $REGEX_DOMINIO ]]; }
 ck_db_opc()  { [ -z "$1" ] || [[ "$1" =~ ^postgres(ql)?(\+psycopg)?://[^[:space:]]+@[^[:space:]]+/[^[:space:]]+$ ]]; }
@@ -214,31 +215,36 @@ perguntar_senha() {
   "$check" "${!var}" || die "senha inválida: use $regra."
 }
 
-fazer_perguntas() {
-  local n=0
+# Servidor sem Coolify: estas perguntas vêm primeiro, o Coolify é instalado, e só depois entram as da compra e do Pro.
+perguntas_coolify() {
   printf '\n\033[1;32m  WhatsBot Pro no Coolify\033[0m\n'
+  printf '  Este servidor ainda não tem o Coolify: ele será instalado primeiro.\n'
+  printf '  O login do Coolify é independente da compra: use qualquer e-mail real seu.\n'
+  printf '  Os domínios precisam já apontar para este servidor.\n\n'
+  perguntar DOMINIO_PAINEL "  $((++NQ))) Domínio do painel do Coolify (opcional; Enter = acessar por IP:8000): " ck_dom_opc \
+    "domínio inválido. Use só o nome ou deixe vazio."
+  # O Coolify só cria o administrador se o e-mail tiver domínio com DNS (MX ou A).
+  perguntar COOLIFY_EMAIL "  $((++NQ))) E-mail de login do Coolify (real, ex.: voce@gmail.com): " email_ok \
+    "e-mail inválido, ou o domínio dele não existe no DNS (o Coolify recusaria o cadastro)."
+  COOLIFY_EMAIL=${COOLIFY_EMAIL,,}
+  perguntar_senha COOLIFY_SENHA COOLIFY_SENHA_GERADA valid_password_cf "$REGRA_SENHA_CF" \
+    "  $((++NQ))) Senha do Coolify (Enter = gerar uma; ou $REGRA_SENHA_CF): "
+}
+
+fazer_perguntas() {
+  if [ "$COOLIFY_NOVO" = 1 ]; then printf '\n\033[1;32m  Agora, o WhatsBot Pro\033[0m\n'
+  else printf '\n\033[1;32m  WhatsBot Pro no Coolify\033[0m\n'; fi
   printf '  O domínio precisa já apontar para este servidor.\n\n'
-  perguntar EMAIL "  $((++n))) Seu e-mail (o mesmo da compra): " email_ok \
+  perguntar EMAIL "  $((++NQ))) Seu e-mail (o mesmo da compra): " email_ok \
     "e-mail inválido, ou o domínio dele não existe no DNS."
   EMAIL=${EMAIL,,}
-  perguntar DOMINIO "  $((++n))) Domínio do WhatsBot Pro (ex.: pro.seudominio.com): " ck_dominio \
-    "domínio inválido. Use só o nome, sem http:// e sem barra."
-  perguntar DB_URL "  $((++n))) URL de um Postgres externo (opcional; Enter = criar um Postgres aqui): " ck_db_opc \
+  perguntar DOMINIO "  $((++NQ))) Domínio do WhatsBot Pro (ex.: pro.seudominio.com): " ck_dominio_pro \
+    "domínio inválido (use só o nome, sem http:// e sem barra) ou igual ao do painel do Coolify."
+  perguntar DB_URL "  $((++NQ))) URL de um Postgres externo (opcional; Enter = criar um Postgres aqui): " ck_db_opc \
     "use o formato postgresql://usuario:senha@host:5432/banco ou deixe vazio."
   ck_nome "$NOME" || die "WHATSBOT_NOME: use 2 a 31 letras minúsculas, números ou hífen."
-  if [ "$COOLIFY_NOVO" = 1 ]; then
-    perguntar DOMINIO_PAINEL "  $((++n))) Domínio do painel do Coolify (opcional; Enter = acessar por IP:8000): " ck_dom_opc \
-      "domínio inválido. Use só o nome ou deixe vazio."
-    [ -z "$DOMINIO_PAINEL" ] || [ "$DOMINIO_PAINEL" != "$DOMINIO" ] || die "o domínio do Pro e o do painel precisam ser diferentes."
-    # O Coolify só cria o administrador se o e-mail tiver domínio com DNS: por isso a mesma checagem do e-mail da compra.
-    perguntar CF_EMAIL "  $((++n))) E-mail de login do Coolify (Enter = $EMAIL): " ck_email_opc \
-      "e-mail inválido, ou o domínio dele não existe no DNS (o Coolify recusaria o cadastro)."
-    CF_EMAIL=${CF_EMAIL:-$EMAIL}; CF_EMAIL=${CF_EMAIL,,}
-    perguntar_senha CF_SENHA CF_SENHA_GERADA valid_password_cf "$REGRA_SENHA_CF" \
-      "  $((++n))) Senha do Coolify (Enter = gerar uma; ou $REGRA_SENHA_CF): "
-  fi
   perguntar_senha SENHA SENHA_GERADA valid_password "$REGRA_SENHA" \
-    "  $((++n))) Senha do administrador do Pro (Enter = gerar uma; ou $REGRA_SENHA): "
+    "  $((++NQ))) Senha do administrador do Pro (Enter = gerar uma; ou $REGRA_SENHA): "
   # postgres:// e postgresql:// -> o driver que o Pro usa
   if [ -n "$DB_URL" ]; then DB_URL=$(sed -E 's#^postgres(ql)?(\+psycopg)?://#postgresql+psycopg://#' <<<"$DB_URL"); fi
 }
@@ -336,7 +342,7 @@ instalar_coolify() {
   export USER=root
   local tmp i ok=0; tmp="$(mktemp -d)"
   curl -fsSL https://cdn.coollabs.io/coolify/install.sh -o "$tmp/install.sh"
-  ROOT_USERNAME=admin ROOT_USER_EMAIL="$CF_EMAIL" ROOT_USER_PASSWORD="$CF_SENHA" AUTOUPDATE=false \
+  ROOT_USERNAME=admin ROOT_USER_EMAIL="$COOLIFY_EMAIL" ROOT_USER_PASSWORD="$COOLIFY_SENHA" AUTOUPDATE=false \
     bash "$tmp/install.sh" "$COOLIFY_VERSION"
   rm -rf "$tmp"
   step "Esperando o Coolify responder"
@@ -352,9 +358,9 @@ instalar_coolify() {
   [ "$(psql_c -c 'select count(*) from users where id = 0')" = 1 ] \
     || die "o administrador do Coolify não foi criado (e-mail sem domínio real?). Veja: docker logs coolify | grep -A3 'Invalid Root User'"
   umask 077
-  { echo "Coolify:   http://$IP:8000"; echo "E-mail:    $CF_EMAIL"; echo "Senha:     $CF_SENHA"; } > /root/coolify-acesso.txt
-  info "Coolify instalado. Login: $CF_EMAIL (dados em /root/coolify-acesso.txt, só o root lê)."
-  if [ "$CF_SENHA_GERADA" = 1 ]; then info "Senha do Coolify (gerada agora): $CF_SENHA"; fi
+  { echo "Coolify:   http://$IP:8000"; echo "E-mail:    $COOLIFY_EMAIL"; echo "Senha:     $COOLIFY_SENHA"; } > /root/coolify-acesso.txt
+  info "Coolify instalado. Login: $COOLIFY_EMAIL (dados em /root/coolify-acesso.txt, só o root lê)."
+  if [ "$COOLIFY_SENHA_GERADA" = 1 ]; then info "Senha do Coolify (gerada agora): $COOLIFY_SENHA"; fi
 }
 
 # O install.sh do Coolify grava a porta SSH 22; com o sshd em outra porta o deploy falha.
@@ -655,29 +661,32 @@ main() {
     info "Coolify não encontrado: ele será instalado junto."
   fi
 
-  fazer_perguntas
-  checar_db_externo
-
-  step "Conferindo o DNS"
-  aguardar_dns "$DOMINIO" "$IP"
-  if [ -n "$DOMINIO_PAINEL" ]; then aguardar_dns "$DOMINIO_PAINEL" "$IP"; fi
-
-  step "Liberando o acesso ao código"
-  gerar_e_registrar_chave
-
   PAINEL_OK=0
   if [ "$COOLIFY_NOVO" = 1 ]; then
+    perguntas_coolify
+    if [ -n "$DOMINIO_PAINEL" ]; then step "Conferindo o DNS do painel"; aguardar_dns "$DOMINIO_PAINEL" "$IP"; fi
     exigir_portas_livres
-    info "testando se $DOMINIO chega a este servidor pela porta 80"
-    if ! testar_porta80 "$DOMINIO"; then
-      warn "não consegui abrir http://$DOMINIO daqui. Porta 80 ocupada ou domínio apontando para outro IP: o certificado HTTPS não será emitido."
-      confirmar_continuar
+    if [ -n "$DOMINIO_PAINEL" ]; then
+      info "testando se $DOMINIO_PAINEL chega a este servidor pela porta 80"
+      if ! testar_porta80 "$DOMINIO_PAINEL"; then
+        warn "não consegui abrir http://$DOMINIO_PAINEL daqui. Porta 80 ocupada ou domínio apontando para outro IP: o certificado HTTPS do painel não será emitido."
+        confirmar_continuar
+      fi
     fi
     step "Instalando o Coolify $COOLIFY_VERSION (instala o Docker junto; leva alguns minutos)"
     instalar_coolify
     ajustar_porta_ssh
     if [ -n "$DOMINIO_PAINEL" ]; then step "Configurando o domínio do painel"; if painel_dominio "$DOMINIO_PAINEL"; then PAINEL_OK=1; fi; fi
   fi
+
+  fazer_perguntas
+  checar_db_externo
+
+  step "Conferindo o DNS"
+  aguardar_dns "$DOMINIO" "$IP"
+
+  step "Liberando o acesso ao código"
+  gerar_e_registrar_chave
 
   step "Criando o WhatsBot Pro no Coolify"
   abrir_api
@@ -708,7 +717,7 @@ main() {
   elif [ "$SENHA_GERADA" = 1 ]; then echo "  Senha:         $SENHA"
   else echo "  Senha:         a que você digitou"; fi
   echo "  Coolify:       $url_painel"
-  [ "$COOLIFY_NOVO" != 1 ] || echo "  Login do Coolify: $CF_EMAIL (senha em /root/coolify-acesso.txt)"
+  [ "$COOLIFY_NOVO" != 1 ] || echo "  Login do Coolify: $COOLIFY_EMAIL (senha em /root/coolify-acesso.txt)"
   echo "  Estes dados: $ACESSO (só o root lê)"
   echo "  Chave do código: $KEY (guarde uma cópia)"
   cat <<EOF
