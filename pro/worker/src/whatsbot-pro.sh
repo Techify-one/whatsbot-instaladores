@@ -221,6 +221,39 @@ fazer_perguntas() {
   if [ -n "$DB_URL" ]; then DB_URL=$(sed -E 's#^postgres(ql)?(\+psycopg)?://#postgresql+psycopg://#' <<<"$DB_URL"); fi
 }
 
+# Postgres externo: falha aqui, em segundos, em vez de depois de 6 a 11 minutos de build.
+# O banco SQL_ASCII conecta e cria as tabelas, mas o app quebra no 1º start (SQLAlchemy não decodifica a versão).
+# Os dados de conexão vão por variáveis PG*, não por argv: a senha não aparece no ps.
+checar_db_externo() {
+  [ -n "$DB_URL" ] || return 0
+  step "Conferindo o Postgres externo"
+  command -v psql >/dev/null 2>&1 || $APT install -y -qq postgresql-client >/dev/null
+  local out rc=0 enc priv
+  out=$(DB_URL="$DB_URL" python3 -I - 2>&1 <<'PY'
+import os, sys
+from urllib.parse import urlsplit, unquote, parse_qsl
+try:
+    u = urlsplit(os.environ["DB_URL"].replace("postgresql+psycopg://", "postgresql://", 1))
+    porta = u.port or 5432
+except ValueError:
+    sys.exit("a porta da URL não é um número.")
+e = dict(os.environ, PGHOST=u.hostname or "", PGPORT=str(porta), PGUSER=unquote(u.username or ""),
+         PGPASSWORD=unquote(u.password or ""), PGDATABASE=unquote(u.path.lstrip("/")), PGCONNECT_TIMEOUT="10")
+for k, v in parse_qsl(u.query):
+    if k == "sslmode": e["PGSSLMODE"] = v
+os.execvpe("psql", ["psql", "-X", "-qtA", "-F", "|", "-c",
+    "select current_setting('server_encoding'), has_schema_privilege(current_user, current_schema(), 'CREATE')"], e)
+PY
+  ) || rc=$?
+  [ "$rc" = 0 ] || die "não consegui usar o Postgres informado: $(head -n1 <<<"$out")
+    Confira usuário, senha, host, porta e nome do banco (o banco precisa já existir) e se este servidor ($IP) tem acesso liberado."
+  enc=${out%%|*}; priv=${out##*|}
+  [ "$enc" = UTF8 ] || die "o banco informado usa a codificação $enc; o WhatsBot Pro exige UTF8.
+    Crie outro banco assim:  CREATE DATABASE whatsbot TEMPLATE template0 ENCODING 'UTF8';"
+  [ "$priv" = t ] || die "o usuário do banco não pode criar tabelas no schema padrão (public). Dê a permissão (GRANT CREATE ON SCHEMA public TO usuario) ou use o dono do banco."
+  info "Postgres externo ok (UTF8, com permissão para criar tabelas)"
+}
+
 # ---------------------------------------------------------------- DNS e alcance
 
 aguardar_dns() {  # $1 = domínio  $2 = IP público deste servidor
@@ -601,6 +634,7 @@ main() {
   fi
 
   fazer_perguntas
+  checar_db_externo
 
   step "Conferindo o DNS"
   aguardar_dns "$DOMINIO" "$IP"
