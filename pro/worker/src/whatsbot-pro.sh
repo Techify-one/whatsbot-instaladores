@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  WhatsBot Pro no Coolify — instalação com domínio, HTTPS e Postgres
-#  Ubuntu ou Debian, como root.
+#  WhatsBot Pro — instalação no Coolify, ou só a chave de acesso ao código
 #
 #    bash <(curl -fsSL https://scripts.techify.site/whatsbot-pro)
 #
-#  Já tem o Coolify neste servidor: o script cria o Postgres e o WhatsBot Pro nele.
-#  Não tem: o script instala o Coolify (e o Docker) antes.
-#  Antes: aponte o domínio (registro A) para o IP público deste servidor
-#  e deixe as portas 80 e 443 abertas no firewall.
+#  A primeira pergunta escolhe o que fazer:
+#    1) Instalar no Coolify (Ubuntu ou Debian, como root, só em servidor Linux)
+#       Já tem o Coolify neste servidor: o script cria o Postgres e o WhatsBot Pro nele.
+#       Não tem: o script instala o Coolify (e o Docker) antes.
+#       Antes: aponte o domínio (registro A) para o IP público deste servidor
+#       e deixe as portas 80 e 443 abertas no firewall.
+#    2) Não instalar: só gera a chave SSH de acesso ao código (somente leitura) e mostra o endereço do
+#       repositório, para usar em outro painel. Roda em Linux, macOS e Windows (Git Bash), sem root,
+#       e pode baixar o código-fonte numa subpasta.
 #
 #  Sem perguntas (automação), defina as variáveis antes do comando:
+#    [WHATSBOT_MODO=coolify|chave]  (sem ele e sem terminal: coolify)
 #    WHATSBOT_EMAIL=voce@gmail.com  WHATSBOT_DOMINIO=pro.exemplo.com  [WHATSBOT_SENHA='...']
 #    [WHATSBOT_DB_URL=postgresql://usuario:senha@host:5432/banco]  [WHATSBOT_NOME=whatsbot-pro]
 #    [WHATSBOT_DOMINIO_PAINEL=coolify.exemplo.com]  [WHATSBOT_FORCAR=1]
 #    Coolify ainda não instalado (obrigatório nesse caso): WHATSBOT_COOLIFY_EMAIL=voce@gmail.com  [WHATSBOT_COOLIFY_SENHA='...']
+#    Modo chave: WHATSBOT_MODO=chave WHATSBOT_EMAIL=voce@gmail.com  [WHATSBOT_BAIXAR=1]  [WHATSBOT_PASTA=./whatsbot-pro]
 # =====================================================================
 set -Eeuo pipefail
 export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
@@ -33,6 +39,9 @@ DOMINIO_PAINEL="${WHATSBOT_DOMINIO_PAINEL:-}"
 COOLIFY_EMAIL="${WHATSBOT_COOLIFY_EMAIL:-}"   # login do Coolify (independe da compra); só vale quando o script instala o Coolify
 COOLIFY_SENHA="${WHATSBOT_COOLIFY_SENHA:-}"
 FORCAR="${WHATSBOT_FORCAR:-0}"
+MODO=""                                   # coolify | chave (escolher_modo)
+BAIXAR="${WHATSBOT_BAIXAR:-}"             # modo chave: 1 = baixa o código sem perguntar
+PASTA="${WHATSBOT_PASTA:-}"               # modo chave: pasta do código (padrão: ./whatsbot-pro)
 
 TOKEN_NAME=whatsbot-pro-provision
 PROJETO="WhatsBot Pro"
@@ -74,6 +83,65 @@ psql_c() { docker exec -i coolify-db psql -q -U coolify -d coolify -v ON_ERROR_S
 doh() {  # doh NOME TIPO_NUMERICO — DNS pelo resolvedor público, o que o Let's Encrypt enxerga
   curl -fsS -m 10 -H 'accept: application/dns-json' "https://1.1.1.1/dns-query?name=$1&type=$2" 2>/dev/null \
     | jq -r --argjson t "$2" '.Answer[]? | select(.type==$t) | .data' 2>/dev/null || true
+}
+
+# Portátil: este trecho roda também no bash 3.2 do macOS e no Git Bash do Windows (sem jq, sem ${x,,}, sem sha256sum).
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
+# jget CAMPO JSON -> valor de um campo de texto do JSON plano que o Worker devolve (sem aspas escapadas).
+jget() { printf '%s' "$2" | sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p' | head -n1; }
+
+# Instalar o Coolify só faz sentido num servidor Linux: nada de macOS, Windows (Git Bash) ou WSL.
+servidor_linux() {
+  [ "$(uname -s 2>/dev/null)" = Linux ] || return 1
+  ! grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null
+}
+plataforma() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) echo "um Mac" ;;
+    MINGW*|MSYS*|CYGWIN*) echo "um Windows" ;;
+    Linux) if servidor_linux; then echo "um Linux"; else echo "um Windows (WSL)"; fi ;;
+    *) echo "outro sistema" ;;
+  esac
+}
+
+# Primeira pergunta: instalar (Coolify) ou só gerar a chave de acesso ao código.
+escolher_modo() {
+  local r="" def=1
+  servidor_linux || def=2
+  case "${WHATSBOT_MODO:-}" in
+    coolify|chave) MODO=$WHATSBOT_MODO ;;
+    "") ;;
+    *) die "WHATSBOT_MODO: use coolify ou chave." ;;
+  esac
+  # Quem já automatizava a instalação (domínio ou dados do Coolify por variável) não ganha pergunta nova.
+  if [ -z "$MODO" ] && { [ -n "$DOMINIO" ] || [ -n "$DOMINIO_PAINEL" ] || [ -n "$COOLIFY_EMAIL" ]; }; then MODO=coolify; fi
+  if [ -z "$MODO" ]; then
+    if have_tty; then
+      printf '\n\033[1;32m  WhatsBot Pro\033[0m\n\n  O que você quer fazer?\n\n'
+      printf '    1) Instalar o WhatsBot Pro neste servidor Linux (no Coolify; se não houver, eu instalo)\n'
+      printf '    2) Não quero instalar: só gerar a minha chave de acesso ao código\n\n'
+      while :; do
+        read -r -p "  Digite 1 ou 2 [$def]: " r </dev/tty
+        case "${r:-$def}" in
+          1) MODO=coolify ;;
+          2) MODO=chave ;;
+          *) printf '    digite 1 ou 2.\n' >&2; continue ;;
+        esac
+        if [ "$MODO" = coolify ] && ! servidor_linux; then
+          printf '    A instalação só funciona em servidor Linux (Ubuntu ou Debian); isto é %s.\n' "$(plataforma)" >&2
+          printf '    Digite 2 para gerar só a chave de acesso e instale depois no seu servidor.\n' >&2
+          MODO=""; continue
+        fi
+        break
+      done
+    else
+      MODO=coolify   # sem terminal e sem WHATSBOT_MODO: como sempre foi
+    fi
+  fi
+  if [ "$MODO" = coolify ] && ! servidor_linux; then
+    die "a instalação só funciona em servidor Linux (Ubuntu ou Debian); isto é $(plataforma). Use WHATSBOT_MODO=chave para gerar só a chave."
+  fi
 }
 
 confirmar_continuar() {
@@ -170,6 +238,7 @@ valid_password_cf() {
 }
 gerar_senha() { printf '%sAa1!' "$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-14)"; }
 
+email_fmt() { [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; }   # só o formato (o modo chave não usa DNS nem jq)
 email_ok() {
   [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || return 1
   [ -n "$(doh cloudflare.com 1)" ] || return 0
@@ -226,7 +295,7 @@ perguntas_coolify() {
   # O Coolify só cria o administrador se o e-mail tiver domínio com DNS (MX ou A).
   perguntar COOLIFY_EMAIL "  $((++NQ))) E-mail de login do Coolify (real, ex.: voce@gmail.com): " email_ok \
     "e-mail inválido, ou o domínio dele não existe no DNS (o Coolify recusaria o cadastro)."
-  COOLIFY_EMAIL=${COOLIFY_EMAIL,,}
+  COOLIFY_EMAIL=$(lower "$COOLIFY_EMAIL")
   perguntar_senha COOLIFY_SENHA COOLIFY_SENHA_GERADA valid_password_cf "$REGRA_SENHA_CF" \
     "  $((++NQ))) Senha do Coolify (Enter = gerar uma; ou $REGRA_SENHA_CF): "
 }
@@ -237,7 +306,7 @@ fazer_perguntas() {
   printf '  O domínio precisa já apontar para este servidor.\n\n'
   perguntar EMAIL "  $((++NQ))) Seu e-mail (o mesmo da compra): " email_ok \
     "e-mail inválido, ou o domínio dele não existe no DNS."
-  EMAIL=${EMAIL,,}
+  EMAIL=$(lower "$EMAIL")
   perguntar DOMINIO "  $((++NQ))) Domínio do WhatsBot Pro (ex.: pro.seudominio.com): " ck_dominio_pro \
     "domínio inválido (use só o nome, sem http:// e sem barra) ou igual ao do painel do Coolify."
   perguntar DB_URL "  $((++NQ))) URL de um Postgres externo (opcional; Enter = criar um Postgres aqui): " ck_db_opc \
@@ -342,8 +411,19 @@ instalar_coolify() {
   export USER=root
   local tmp i ok=0; tmp="$(mktemp -d)"
   curl -fsSL https://cdn.coollabs.io/coolify/install.sh -o "$tmp/install.sh"
-  ROOT_USERNAME=admin ROOT_USER_EMAIL="$COOLIFY_EMAIL" ROOT_USER_PASSWORD="$COOLIFY_SENHA" AUTOUPDATE=false \
-    bash "$tmp/install.sh" "$COOLIFY_VERSION"
+  # O install.sh do Coolify tem tempo limite (60 s para ficar saudável, 180 s para subir): em servidor lento ele desiste mesmo
+  # com tudo certo, às vezes com o container do Coolify criado mas PARADO. Se o container existe, inicia-o (se estiver parado)
+  # e espera o Coolify responder (até 6 min, logo abaixo); se nem existe, falha já.
+  if ! ROOT_USERNAME=admin ROOT_USER_EMAIL="$COOLIFY_EMAIL" ROOT_USER_PASSWORD="$COOLIFY_SENHA" AUTOUPDATE=false \
+      bash "$tmp/install.sh" "$COOLIFY_VERSION"; then
+    { command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' | grep -qx coolify; } \
+      || die "o instalador do Coolify falhou antes de subir o Coolify (veja as mensagens acima)."
+    warn "o instalador do Coolify desistiu por tempo (comum em servidor lento); vou conferir se o Coolify subiu."
+    if ! docker ps --format '{{.Names}}' | grep -qx coolify; then
+      info "o container do Coolify estava criado mas parado; iniciando."
+      docker start coolify >/dev/null || die "não consegui iniciar o container do Coolify. Veja: docker logs coolify"
+    fi
+  fi
   rm -rf "$tmp"
   step "Esperando o Coolify responder"
   for i in $(seq 1 90); do
@@ -351,9 +431,10 @@ instalar_coolify() {
     sleep 4
   done
   if [ "$ok" != 1 ]; then docker ps -a; die "o Coolify não respondeu em /api/health após 6 minutos."; fi
-  for i in $(seq 1 60); do
+  # O administrador só nasce quando as ~520 migrações do banco terminam: com o disco lento isso passa de 2 minutos (medido: ~6).
+  for i in $(seq 1 150); do
     if [ "$(psql_c -c 'select count(*) from users where id = 0' 2>/dev/null || true)" = 1 ]; then break; fi
-    sleep 2
+    sleep 4
   done
   [ "$(psql_c -c 'select count(*) from users where id = 0')" = 1 ] \
     || die "o administrador do Coolify não foi criado (e-mail sem domínio real?). Veja: docker logs coolify | grep -A3 'Invalid Root User'"
@@ -393,47 +474,135 @@ echo "DASH_OK ".instanceSettings()->fqdn.PHP_EOL;' 2>&1 || true)
 
 # Uma chave por e-mail neste servidor, reaproveitada nas próximas execuções (vários WhatsBot Pro, mesma chave).
 gerar_e_registrar_chave() {
-  local h; h=$(printf '%s' "$EMAIL" | sha256sum | cut -c1-8)
+  local h; h=$(printf '%s' "$EMAIL" | sha256 | cut -c1-8)
   KEY="$CHAVES_DIR/chave-$h"
   umask 077; mkdir -p "$CHAVES_DIR"
   KEY_NOVA=0
   if [ ! -s "$KEY" ]; then
     ssh-keygen -q -t ed25519 -N '' -C "whatsbot-pro $EMAIL" -f "$KEY"
     KEY_NOVA=1
+  elif [ ! -s "$KEY.pub" ]; then
+    # Chave privada copiada de outra máquina, sem a pública. Zip/pendrive/scp costumam deixá-la com permissão aberta (o ssh recusa).
+    chmod 600 "$KEY" 2>/dev/null || true
+    ssh-keygen -y -f "$KEY" > "$KEY.pub" 2>/dev/null \
+      || { rm -f "$KEY.pub"; die "a chave $KEY não pôde ser lida (arquivo inválido ou com senha). Mude o nome dela e rode de novo para gerar outra."; }
   fi
-  local resp code body
-  resp=$(jq -nc --arg e "$EMAIL" --arg k "$(cat "$KEY.pub")" --arg m "$(hostname -s)" '{email:$e, chave_publica:$k, maquina:$m}' \
+  # JSON à mão (sem jq, que o Mac e o Git Bash do Windows não têm): o e-mail já passou na regex (sem aspas nem barras),
+  # a chave pública é base64 e o nome da máquina é limpo.
+  local resp code body maq
+  maq=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9.-' | cut -c1-40 || true)
+  # Só "ssh-ed25519 <base64>": o comentário da chave (pode ter aspas ou barra) quebraria o JSON e o Worker não precisa dele.
+  resp=$(printf '{"email":"%s","chave_publica":"%s","maquina":"%s"}' "$EMAIL" "$(tr -d '\r\n' < "$KEY.pub" | cut -d' ' -f1,2)" "${maq:-pc}" \
     | curl -sS -m 30 -w '\n%{http_code}' -X POST "$API/pro/chave" -H 'Content-Type: application/json' --data-binary @- ) \
-    || die "não consegui falar com $API. Confira a internet deste servidor."
+    || die "não consegui falar com $API. Confira a internet."
   code=${resp##*$'\n'}; body=${resp%$'\n'*}
   if [ "$code" != 200 ]; then
     [ "$KEY_NOVA" = 1 ] && rm -f "$KEY" "$KEY.pub"
-    warn "$(jq -r '.erro // "resposta inesperada"' <<<"$body" 2>/dev/null || echo "resposta inesperada (HTTP $code)")"
-    local c; c=$(jq -r '.contato // empty' <<<"$body" 2>/dev/null || true)
+    local msg; msg=$(jget erro "$body")
+    warn "${msg:-resposta inesperada (HTTP $code)}"
+    local c; c=$(jget contato "$body")
     [ -z "$c" ] || info "Fale com a Techify: $c"
     die "não foi possível liberar o acesso ao código."
   fi
-  REPO=$(jq -r .repositorio <<<"$body")
-  CONTATO=$(jq -r '.contato // empty' <<<"$body")
-  [ -n "$REPO" ] && [ "$REPO" != null ] || die "resposta do servidor sem o endereço do repositório."
-  if [ "$KEY_NOVA" = 1 ]; then
+  REPO=$(jget repositorio "$body")
+  CONTATO=$(jget contato "$body")
+  [ -n "$REPO" ] || die "resposta do servidor sem o endereço do repositório."
+  # No modo chave a chave é o objetivo: aparece sempre (com terminal). No modo Coolify, só quando é nova.
+  if [ "$KEY_NOVA" = 1 ] || [ "$MODO" = chave ]; then
     echo
     echo "  ----------------------------------------------------------------"
     echo "  Chave de acesso ao código do WhatsBot Pro (GUARDE, não perca):"
-    echo "  Arquivo neste servidor: $KEY"
+    echo "  Arquivo: $KEY"
     # Sem terminal (automação, CI) a chave privada iria parar num log: lá só o caminho.
     if have_tty; then
       echo
       cat "$KEY"
     fi
     echo "  ----------------------------------------------------------------"
-    if have_tty && [ "$FORCAR" != 1 ]; then
+    if [ "$KEY_NOVA" = 1 ] && have_tty && [ "$FORCAR" != 1 ]; then
       local r=""
       while [ "$r" != guardei ]; do read -r -p "  Copie a chave acima para um lugar seguro e digite 'guardei': " r </dev/tty; done
     fi
   else
     info "chave de acesso reaproveitada: $KEY"
   fi
+}
+
+# ---------------------------------------------------------------- modo "só a chave"
+
+# Sem root, sem apt, sem Docker, sem DNS: roda no Linux, no macOS e no Git Bash do Windows.
+modo_chave() {
+  CHAVES_DIR="${HOME:-.}/.whatsbot-pro"   # root: /root/.whatsbot-pro, a mesma pasta do modo Coolify
+  local f
+  for f in ssh-keygen curl tr sed; do
+    command -v "$f" >/dev/null 2>&1 || die "preciso do comando '$f'. Instale o OpenSSH (Windows: o Git for Windows já traz) e rode de novo."
+  done
+  printf '\n\033[1;32m  Chave de acesso ao código do WhatsBot Pro\033[0m\n'
+  printf '  Vou gerar uma chave SSH só sua, somente leitura, e mostrar o endereço do repositório.\n'
+  printf '  Com ela você instala no painel que quiser (Coolify, Dokploy...) ou baixa o código.\n\n'
+  perguntar EMAIL "  1) Seu e-mail (o mesmo da compra): " email_fmt "e-mail inválido."
+  EMAIL=$(lower "$EMAIL")
+
+  step "Liberando o acesso ao código"
+  gerar_e_registrar_chave
+
+  local arq
+  arq="$CHAVES_DIR/acesso-chave-$(basename "$KEY" | sed 's/^chave-//').txt"   # um por e-mail: outro e-mail não apaga o anterior
+  umask 077
+  {
+    echo "Repositório:    $REPO"
+    echo "Chave privada:  $KEY"
+    echo "E-mail:         $EMAIL"
+  } > "$arq"
+
+  baixar_codigo || true
+
+  printf '\n\033[1;32mPronto!\033[0m\n\n'
+  echo "  Repositório (SSH):  $REPO"
+  echo "  Chave privada:      $KEY"
+  echo "  Estes dados:        $arq"
+  [ -z "${CODIGO_DIR:-}" ] || echo "  Código-fonte em:    $CODIGO_DIR"
+  cat <<EOF
+
+  No painel onde for instalar, cadastre a chave privada (o conteúdo do arquivo acima) e use o endereço do repositório.
+  Para ver o código-fonte ou pedir ajuda, fale com a Techify${CONTATO:+: $CONTATO}.
+EOF
+}
+
+# Baixa o código para uma SUBPASTA (nunca despeja arquivos na pasta onde o comando foi dado). Pasta que já é o repositório: atualiza.
+baixar_codigo() {
+  CODIGO_DIR=""
+  local r="" dest="${PASTA:-whatsbot-pro}" quer=0 ssh_cmd
+  if [ "$BAIXAR" = 1 ]; then quer=1
+  elif [ -z "$BAIXAR" ] && have_tty; then
+    read -r -p "  Baixar o código-fonte agora, numa pasta deste computador? [s/N] " r </dev/tty
+    case "$r" in s|S|sim|SIM|y|Y) quer=1 ;; esac
+  fi
+  [ "$quer" = 1 ] || return 0
+  if ! command -v git >/dev/null 2>&1; then
+    warn "o Git não está instalado, então não baixei o código. Instale o Git (Windows: https://git-scm.com/download/win) e rode de novo."
+    return 1
+  fi
+  if [ -z "$PASTA" ] && have_tty; then
+    read -r -p "  Em qual pasta? (Enter = ./whatsbot-pro, dentro de $(pwd)): " r </dev/tty
+    [ -z "$r" ] || dest=$r
+  fi
+  # shellcheck disable=SC2088  # o til é o texto que o aluno digita: nem o read nem a variável o expandem
+  case "$dest" in "~") dest=$HOME ;; "~/"*) dest="$HOME/${dest#\~/}" ;; esac
+  case "$dest" in -*) dest="./$dest" ;; esac   # pasta que começa com '-' viraria opção do git
+  local kq="${KEY//\'/\'\\\'\'}"               # apóstrofo no caminho (C:\Users\O'Brien) quebraria as aspas do comando
+  ssh_cmd="ssh -i '$kq' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+  if [ -d "$dest/.git" ] && [ "$(git -C "$dest" remote get-url origin 2>/dev/null || true)" = "$REPO" ]; then
+    step "A pasta $dest já é o repositório: atualizando"
+    ( umask 022; GIT_SSH_COMMAND="$ssh_cmd" git -C "$dest" pull --ff-only ) || { warn "não consegui atualizar $dest."; return 1; }
+  elif [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null || true)" ]; then
+    warn "a pasta '$dest' já existe e não está vazia. Escolha outra (WHATSBOT_PASTA=outra-pasta) ou apague-a."
+    return 1
+  else
+    step "Baixando o código para $dest"
+    ( umask 022; GIT_SSH_COMMAND="$ssh_cmd" git clone --branch "$BRANCH" "$REPO" "$dest" ) || { warn "o download falhou. Veja a mensagem acima."; return 1; }
+  fi
+  CODIGO_DIR=$(cd "$dest" && pwd)
 }
 
 # ---------------------------------------------------------------- Coolify (API)
@@ -629,6 +798,7 @@ gravar_acesso() {
     echo "E-mail:         $EMAIL"
     if [ "$ADMIN_APLICADO" = 1 ]; then echo "Senha:          $SENHA"; else echo "Senha:          (já havia um administrador; use a senha dele)"; fi
     echo "Chave (código): $KEY"
+    echo "Repositório:    $REPO"
   } > "$ACESSO"
   if [ "$ADMIN_APLICADO" = 1 ] && [ "$SENHA_GERADA" = 1 ]; then
     info "Senha do administrador (gerada agora): $SENHA   (também em $ACESSO)"
@@ -638,6 +808,9 @@ gravar_acesso() {
 # ---------------------------------------------------------------- main
 
 main() {
+  escolher_modo
+  if [ "$MODO" = chave ]; then modo_chave; return 0; fi
+
   [ "$(id -u)" -eq 0 ] || die "rode como root (use: sudo -i)"
   # shellcheck disable=SC1091
   . /etc/os-release
@@ -720,6 +893,7 @@ main() {
   [ "$COOLIFY_NOVO" != 1 ] || echo "  Login do Coolify: $COOLIFY_EMAIL (senha em /root/coolify-acesso.txt)"
   echo "  Estes dados: $ACESSO (só o root lê)"
   echo "  Chave do código: $KEY (guarde uma cópia)"
+  echo "  Repositório:     $REPO"
   cat <<EOF
 
   Firewall: deixe abertas as portas 80 e 443.

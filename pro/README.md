@@ -1,6 +1,7 @@
 # WhatsBot Pro — instalador
 
 Instala o WhatsBot Pro (repositório privado) no Coolify do aluno, com Postgres, domínio e HTTPS.
+Ou, se o aluno preferir outro painel, só gera a chave de acesso ao código (opção 2 do menu; roda também em Mac e Windows com Git Bash).
 
 ```bash
 bash <(curl -fsSL https://scripts.techify.site/whatsbot-pro)
