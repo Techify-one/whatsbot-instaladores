@@ -638,7 +638,8 @@ SQL
 }
 
 # Container em execução do app (o do build antigo some quando o novo sobe; pega o mais recente).
-container_app() { docker ps --format '{{.Names}}' | grep "^${APP_UUID}-" | sort | tail -n1 || true; }
+# Pelo rótulo do Coolify: o nome muda conforme o build pack (Compose: whatsbot-<uuid>-<data>).
+container_app() { docker ps --filter "label=coolify.applicationUuid=$APP_UUID" --format '{{.Names}}' | sort | tail -n1 || true; }
 
 # POST direto no container, sem DNS nem certificado no caminho. Imprime o código HTTP (vazio = sem container/sem resposta).
 admin_http() {  # admin_http ROTA JSON
@@ -711,14 +712,19 @@ criar_pro() {
 
   app=$(capi GET /applications | jq -r --arg n "$NOME" 'first(.[] | select(.name == $n) | .uuid) // empty')
   if [ -z "$app" ]; then
+    # Docker Compose (o docker-compose.yaml do repositório traz o serviço "whatsbot", a porta 8080 e os volumes nomeados).
+    # connect_to_docker_network: sem isso o app Compose nasce numa rede isolada e não enxerga o Postgres do Coolify pelo nome.
     app=$(capi POST /applications/private-deploy-key "$(jq -nc \
       --arg p "$project" --arg s "$server" --arg k "$kuuid" --arg r "$REPO" --arg b "$BRANCH" --arg n "$NOME" --arg d "$fqdn" \
       '{project_uuid: $p, server_uuid: $s, environment_name: "production", private_key_uuid: $k, git_repository: $r, git_branch: $b,
-        build_pack: "dockerfile", ports_exposes: "8080", name: $n, domains: $d, health_check_enabled: false, instant_deploy: false}')" | jq -r .uuid)
+        build_pack: "dockercompose", docker_compose_location: "/docker-compose.yaml",
+        docker_compose_domains: [{name: "whatsbot", domain: $d}], connect_to_docker_network: true,
+        name: $n, instant_deploy: false}')" | jq -r .uuid)
     [ -n "$app" ] && [ "$app" != null ] || die "o Coolify não criou o aplicativo."
   else
     info "o aplicativo '$NOME' já existe no Coolify; retomando de onde parou."
-    atual=$(capi GET "/applications/$app" | jq -r '.fqdn // empty')
+    # No Compose o domínio fica em docker_compose_domains (o fqdn é vazio).
+    atual=$(capi GET "/applications/$app" | jq -r '(.docker_compose_domains // "{}") | (if type == "string" then (fromjson? // {}) else . end) | .whatsbot.domain // empty')
     [ "$atual" = "$fqdn" ] || die "o aplicativo '$NOME' existente usa '${atual:-nenhum domínio}', diferente de $fqdn. Use o mesmo domínio, ou WHATSBOT_NOME=outro-nome para criar outra instância."
   fi
   APP_UUID=$app
@@ -730,12 +736,7 @@ criar_pro() {
   grep -qx WHATSBOT_PUBLIC_URL <<<"$have" \
     || capi POST "/applications/$app/envs" "$(jq -nc --arg v "$fqdn" '{key: "WHATSBOT_PUBLIC_URL", value: $v, is_preview: false, is_literal: true}')" >/dev/null
 
-  # Sem volumes nomeados, cada redeploy começaria com /app/storages vazio (sessão do WhatsApp e arquivos).
-  have=$(capi GET "/applications/$app/storages" | jq -r '.persistent_storages[].mount_path')
-  for v in storages statics logs; do
-    grep -qx "/app/$v" <<<"$have" \
-      || capi POST "/applications/$app/storages" "$(jq -nc --arg n "$v" --arg m "/app/$v" '{type: "persistent", name: $n, mount_path: $m}')" >/dev/null
-  done
+  # Volumes (storages, statics, logs): já são nomeados no docker-compose.yaml do repositório e sobrevivem ao redeploy.
 
   # Reexecução: acompanha o deploy que já está rodando, ou não reconstrói um app que já está no ar.
   d=$(psql_c -c "select deployment_uuid from application_deployment_queues where application_id = (select id::text from applications where uuid = '$app') and status in ('in_progress','queued') order by id desc limit 1")
